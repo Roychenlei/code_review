@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 from pymongo import MongoClient
+import time
 import re
 from lxml import etree
 from cache import cache
@@ -10,11 +11,13 @@ from config import (
     MONGO_DB_NAME,
     WIKI_COLLECTION_PARSED,
     WIKI_COLLECTION_CLEAN,
+    WIKI_COLLECTION_ORIGINAL,
     CRITERIA,
 )
 
+table_xpath_first = '//*[@id="mw-content-text"]/div/table[@class="infobox vcard"]'  # noqa, 501
+table_xpath_second = '//*[@id="mw-content-text"]/div/div/table[@class="infobox vcard"]'  # noqa, 501
 
-table_xpath = '//*[@id="mw-content-text"]/div/table[@class="infobox vcard"]'
 
 ptn_clean = re.compile('\W+')
 stop_words = {
@@ -249,6 +252,19 @@ meta_key_map = {
 }
 
 
+def copy_coll_original_to_parsed():
+    client = MongoClient(host=MONGO_HOST)
+
+    wiki_coll_original = client[MONGO_DB_NAME][WIKI_COLLECTION_ORIGINAL]
+    wiki_coll_parsed = client[MONGO_DB_NAME][WIKI_COLLECTION_PARSED]
+
+    # wiki_coll_parsed.remove({})
+    pipeline = [{"$match": {}},
+                {"$out": WIKI_COLLECTION_PARSED},
+                ]
+    wiki_coll_original.aggregate(pipeline)
+
+
 def init_skip():
 
     client = MongoClient(host=MONGO_HOST)
@@ -297,8 +313,9 @@ def skip_no_rightbox():
 
 
 def find_websites_rightbox(text):
-    resutls = []
+    results = []
 
+    tmp = []
     html = etree.HTML(text)
     tables = html.xpath('//table[@class="infobox vcard"]')
     if not tables:
@@ -306,10 +323,17 @@ def find_websites_rightbox(text):
 
     for table in tables:
         info_text = etree.tostring(table)
-        ptn = re.compile('Website</th>\s*<td.*?href="(.*?)">.*?</td>', re.DOTALL)
-        resutls.extend(ptn.findall(info_text))
+        ptn = re.compile('Website</th>\s*<td(.*)</td>', re.DOTALL)
+        ptn2 = re.compile('href="([^"]*)"')
 
-    return [extract_domain(i) for i in resutls]
+        sr = ptn.search(info_text)
+        if sr:
+            grps = sr.groups()
+            if grps:
+                tmp = ptn2.findall(grps[0])
+        results.extend(tmp)
+
+    return [extract_domain(i) for i in results]
 
 
 def build_name_string(text):
@@ -324,15 +348,16 @@ def match_by_domain_name():
 
     client = MongoClient(host=MONGO_HOST)
     wiki_coll = client[MONGO_DB_NAME][WIKI_COLLECTION_PARSED]
-
     print '%s to match' % wiki_coll.count(filter_1)
 
+    cnt_ok = 0
     for r in wiki_coll.find(filter_1, {'in_company_name': 1,
                                        'in_domain_name': 1,
                                        'search_results': 1,
                                        }):
         domain_name = r.get('in_domain_name')
-        input_string = build_name_string(r.get('in_company_name'))
+        # company name could be None
+        input_string = build_name_string(r.get('in_company_name', ''))
 
         matched = set()
 
@@ -347,16 +372,18 @@ def match_by_domain_name():
 
             # match rightbox domain
             domain_list = find_websites_rightbox(html_content)
-            if not match_rightbox_domain and domain_name in domain_list:
+            if not match_rightbox_domain and domain_list and domain_list[0] == domain_name:  # noqa; 501
                 match_rightbox_domain = True
                 wiki_coll.update(
                     {'_id': r.get('_id')},
-                    {'$set': {'search_results.%s.match_rightbox_domain' % idx: 1 + domain_list.index(domain_name)}})
+                    {'$set': {'search_results.%s.match_rightbox_domain' % idx: 1 + domain_list.index(domain_name)}})  # noqa; 501
+                if domain_list.index(domain_name) > 0:
+                    print("WARN: non first domain name matched: %s in %s" % (domain_name, str(domain_list)))  # noqa; 501
             # elif domain_name in html_content:
             #   print domain_name
 
             # name exactly match
-            if not match_exact_name and input_string == build_name_string(s.get('name')):
+            if not match_exact_name and input_string == build_name_string(s.get('name')):  # noqa; 501
                 match_exact_name = True
                 wiki_coll.update(
                     {'_id': r.get('_id')},
@@ -369,14 +396,17 @@ def match_by_domain_name():
             #    print '%s. %s' % (r.get('_id'), wiki_url)
 
         if len(matched) > 1:
-            print 'more than 1 one matched. %s. %s' % (r.get('_id'), ' | '.join(matched))
+            print 'more than 1 one matched. %s. %s' % (r.get('_id'), ' | '.join(matched))  # noqa; 501
         elif len(matched) == 1:
             wiki_coll.update(
                 {'_id': r.get('_id')},
                 {'$set': {
                     'matched': 1,
+                    '_matched_by': 'match_by_domain_name',
                     'wiki_url': matched.pop(),
                 }})
+            cnt_ok += 1
+    print 'matched by domain name:', cnt_ok
 
 
 def extract_children_text(xpath_node):
@@ -397,6 +427,39 @@ def clean_no_right_box():
         )
 
 
+def extract_domian_from_rightbox(url):
+    domain_name = url
+    if domain_name.startswith('http://'):
+        domain_name = domain_name[7:]
+    if domain_name.startswith('https://'):
+        domain_name = domain_name[8:]
+    return domain_name.rstrip('/')
+
+
+def extract_website(text):
+    results = []
+
+    tmp = []
+    html = etree.HTML(text)
+    tables = html.xpath('//table[@class="infobox vcard"]')
+    if not tables:
+        return []
+
+    for table in tables:
+        info_text = etree.tostring(table)
+        ptn = re.compile('Website</th>\s*<td(.*)</td>', re.DOTALL)
+        ptn2 = re.compile('href="([^"]*)"')
+
+        sr = ptn.search(info_text)
+        if sr:
+            grps = sr.groups()
+            if grps:
+                tmp = ptn2.findall(grps[0])
+        results.extend(tmp)
+
+    return [extract_domian_from_rightbox(i) for i in results]
+
+
 def parse_rightbox_texts():
 
     client = MongoClient(host=MONGO_HOST)
@@ -408,7 +471,10 @@ def parse_rightbox_texts():
             metas = []
 
             html = etree.HTML(s.get('html_content'))
-            for table in html.xpath(table_xpath):
+            tables = html.xpath(table_xpath_first)
+            if not tables:
+                tables = html.xpath(table_xpath_second)
+            for table in tables:
 
                 captions = [c.text for c in table.xpath('./caption')]
                 if len(captions) > 1:
@@ -419,6 +485,13 @@ def parse_rightbox_texts():
                     'value': extract_children_text(item.xpath('./td')).strip(),
                 } for item in table.xpath('.//tr')]
 
+                url_from_wiki = extract_website(s.get('html_content'))
+                if url_from_wiki:
+                    find_urls = url_from_wiki[0]
+                    for item in meta:
+                        if item['key'] == 'Website':
+                            item['value'] = find_urls
+                            break
                 if not meta:
                     print 'ERROR. no meta in %s' % (wiki_url,)
 
@@ -467,31 +540,45 @@ def create_clean_db():
     print '%s to copy' % wiki_coll.count(filter_1)
 
     # keys = set()
+    cnt_domain = 0
+    cnt_more_company = 0
 
     for r in wiki_coll.find({'matched': 1}):
         wiki_url = r.get('wiki_url')
+        domain_is_ok = False
+        find_more_company_is_ok = False
         for idx, s in enumerate(r.get('search_results')):
             metas = s.get('metas')
-            meta_idx = (s.get('match_rightbox_domain') or 1) - 1
+            meta_idx = (s.get('match_rightbox_domain') or s.get('match_criteria') or 1) - 1  # noqa; 501
             meta = metas and metas[meta_idx]
             if wiki_url == s.get('wiki_url') and meta:
+                if s.get('match_criteria'):
+                    find_more_company_is_ok = True
                 try:
-                    # keys.update({i['key'] for i in meta['meta'] if i['key'].strip('-') and i['value']})
-                    info = {meta_key_map.get(i['key'], i['key']): i['value'] for i in meta['meta'] if i['key'].strip('-') and i['value']}
+                    # keys.update({i['key'] for i in meta['meta'] if i['key'].strip('-') and i['value']})  # noqa; 501
+                    info = {meta_key_map.get(i['key'], i['key']): i['value'] for i in meta['meta'] if i['key'].strip('-') and i['value']}  # noqa; 501
                     info['Description'] = s.get('Description')
                     info['Legal Name'] = (meta.get('captions') or [None])[0]
                     info['Name'] = r.get('in_company_name')
 
                     wiki_coll.update({'_id': r.get('_id')}, {'$set': info})
+                    domain_is_ok = True
                 except Exception as e:
                     import json
                     print r.get('_id')
                     print e
-                    print json.dumps({i['key']: i['value'] for i in meta['meta'] if i['key'].strip('-') and i['value']}, indent=4)
+                    print json.dumps({i['key']: i['value'] for i in meta['meta'] if i['key'].strip('-') and i['value']}, indent=4)  # noqa; 501
     # print u'\n'.join(map(unicode, keys))
+        if domain_is_ok:
+            cnt_domain += 1
+        else:
+            print'failed to save companyID: %d' % r.get('_id')
+        if find_more_company_is_ok:
+            cnt_more_company += 1
+    print "copied company:%d, more company:%d" % (cnt_domain, cnt_more_company)  # noqa; 501
 
 
-# @cache
+@cache
 def find_topn_meta_key(host, db_name, collection_name):
     filter_matched = {'matched': 1}
     client = MongoClient(host=host)
@@ -511,19 +598,17 @@ def find_topn_meta_key(host, db_name, collection_name):
                         count_key[ele['key']] = 0
                     count_key[ele['key']] += 1
 
-    return sorted(count_key.items(),key = lambda item :item[1], reverse=True)
+    return sorted(count_key.items(), key=lambda item: item[1], reverse=True)
 
-# @cache
+
 def find_more_company():
 
-    filter_not_matched = {'matched':{'$ne': 1},'skip_code': 0}
+    filter_not_matched = {'matched': {'$ne': 1}, 'skip_code': 0}
 
-    meta_keys = find_topn_meta_key(MONGO_HOST, MONGO_DB_NAME, WIKI_COLLECTION_PARSED)
+    meta_keys = find_topn_meta_key(MONGO_HOST, MONGO_DB_NAME, WIKI_COLLECTION_PARSED)  # noqa; 501
 
     # for k, v in meta_keys:
     #     print '%s: %s' % (k, v)
-
-
 
     client = MongoClient(host=MONGO_HOST)
     wiki_coll = client[MONGO_DB_NAME][WIKI_COLLECTION_PARSED]
@@ -531,39 +616,71 @@ def find_more_company():
     print '%s not matched' % wiki_coll.count(filter_not_matched)
     cnt_ok = 0
     cnt_error = 1
-    for r in wiki_coll.find(filter_not_matched):
-        for s in r.get('search_results'):
+    for r in wiki_coll.find(filter_not_matched, {'in_company_name': 1,
+                                                 'in_domain_name': 1,
+                                                 'search_results': 1,
+                                                 }):
+        is_ok = False
+        for idx, s in enumerate(r.get('search_results')):
+            match_criteria = s.get('match_criteria') or False
+            wiki_url = s.get('wiki_url')
+            company_name = r.get('in_company_name')
+
+            html_content = s.get('html_content')
             if s.get('match_exact_name'):
-                wiki_url = s.get('wiki_url')
-                company_name = r.get('in_company_name')
+                for meta_idx, i in enumerate(s['metas']):
 
-                for i in s['metas']:
-
-                    data_key=set()
+                    data_key = set()
                     for ele in i['meta']:
                         data_key.add(ele['key'])
 
                     if (CRITERIA - data_key):
-                        cnt_error += 1
+                        pass
                     else:
-                        cnt_ok +=1
+                        is_ok = True
                         wiki_coll.update(
-                            {'_id':ele.get('_id')},
-                            {'$set':{
+                            {'_id': r.get('_id')},
+                            {'$set': {
                                 'matched': 1,
-                                'wiki_urli': wiki_url,
+                                '_matched_by': 'find_more_company',
+                                'wiki_url': wiki_url,
+                                'search_results.%s.match_criteria' % idx: meta_idx + 1,  # noqa; 501
                                 }})
-
-
+        if is_ok:
+            cnt_ok += 1
+        else:
+            cnt_error += 1
+    print("found: %d/%d" % (cnt_ok, cnt_error))
 
 if __name__ == '__main__':
+    starttime = time.time()
+    copy_coll_original_to_parsed()
+    print('till cop_coll_original_to_parsed: %6f' % (time.time() - starttime))  # noqa; 501
     init_skip()
-
+    print('till init_skip: %6f' % (time.time() - starttime))
     skip_no_rightbox()
+    print('till skip_no_rightbox: %6f' % (time.time() - starttime))
     clean_no_right_box()
+    print('till clean_no_right_box: %6f' % (time.time() - starttime))
     parse_brief_intro()
+    print('till parse_brief_intro: %6f' % (time.time() - starttime))
     parse_rightbox_texts()
-    # gen_meta_key_list()
-    match_by_domain_name() 
+    print('till parse_rightbox_texts: %6f' % (time.time() - starttime))
+    match_by_domain_name()
+    print('till match_by_domain_name: %6f' % (time.time() - starttime))
     find_more_company()
+    print('till find_more_company: %6f' % (time.time() - starttime))
     create_clean_db()
+    print('till create_clean_db: %6f' % (time.time() - starttime))
+
+    # copy_coll_original_to_parsed()
+    # init_skip()
+    # skip_no_rightbox()
+    # clean_no_right_box()
+    # parse_brief_intro()
+    # parse_rightbox_texts()
+    # gen_meta_key_list()
+    # match_by_domain_name() 
+    # find_more_company()
+    # create_clean_db()
+
